@@ -1,0 +1,69 @@
+name: Train LSTM Seasonal Model
+
+on:
+  schedule:
+    # ── runs at 03:00 UTC on the 1st of every month ──
+    - cron: "0 3 1 * *"
+  workflow_dispatch: {}  # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write   # needed to push history.csv and lstm_model.pkl back
+
+jobs:
+  train-lstm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo B
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run seasonal LSTM training
+        env:
+          HOURLY_URL: "https://github.com/nayanananto/wind-data-pipeline/blob/main/data/wind_data.csv"
+        run: |
+          mkdir -p data models
+          # if history.csv doesn't exist yet, create an empty skeleton
+          if [ ! -f data/history.csv ]; then
+            echo "datetime,wind_speed" > data/history.csv
+          fi
+
+          python seasonal_train_lstm.py \
+            --history data/history.csv \
+            --hourly_url "$HOURLY_URL" \
+            --max_history_days 730 \
+            --train_days 180 \
+            --lookback 168 \
+            --horizon 72 \
+            --units 96 \
+            --epochs 25 \
+            --batch_size 32 \
+            --dropout 0.2 \
+            --loss mse \
+            --output_dir models \
+            --model_name lstm_model.pkl
+
+      - name: Commit and push updated artifacts
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add data/history.csv models/lstm_model.pkl
+
+          # only commit if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "Update history and lstm_model.pkl [CI]"
+            git push origin HEAD
+          else
+            echo "No changes to commit."
+          fi
