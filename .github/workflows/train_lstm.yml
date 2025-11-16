@@ -29,21 +29,23 @@ jobs:
 
       - name: Run seasonal LSTM training
         env:
-          HOURLY_URL: "https://github.com/nayanananto/wind-data-pipeline/blob/main/data/wind_data.csv"
+          HOURLY_URL: "https://raw.githubusercontent.com/nayanananto/wind-data-pipeline/main/data/wind_data.csv"
         run: |
           mkdir -p data models
           # if history.csv doesn't exist yet, create an empty skeleton
-          if [ ! -f data/history.csv ]; then
-            echo "datetime,wind_speed" > data/history.csv
+          if [ ! -f data/wind_data.csv ]; then
+            echo "datetime,wind_speed" > data/wind_data.csv
           fi
 
           python seasonal_train_lstm.py \
-            --history data/history.csv \
+            --history data/wind_data.csv \
             --hourly_url "$HOURLY_URL" \
+            --time_col datetime \
+            --target_col wind_speed \
             --max_history_days 730 \
             --train_days 180 \
             --lookback 168 \
-            --horizon 72 \
+            --horizon 168 \
             --units 96 \
             --epochs 25 \
             --batch_size 32 \
