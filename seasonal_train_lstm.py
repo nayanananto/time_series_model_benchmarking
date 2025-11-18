@@ -49,6 +49,37 @@ def set_reproducible(seed: int = 42):
     except Exception:
         pass
 
+import os
+import pandas as pd
+
+import os
+import pandas as pd
+
+def fetch_wind_data(remote_url, local_path="data/wind_data.csv", hist_path="data/historical_wind.csv"):
+    """
+    Use historical_wind exactly like the reference function.
+    """
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    df_remote = pd.read_csv(remote_url, parse_dates=["datetime"])
+    df_hist = pd.read_csv(hist_path, parse_dates=["datetime"])
+
+    out = (
+        pd.concat([df_remote, df_hist], ignore_index=True)
+          .drop_duplicates(subset=["datetime"], keep="last")
+          .sort_values("datetime")
+          .reset_index(drop=True)
+    )
+
+    out.to_csv(local_path, index=False)
+
+    print("[DEBUG] Merged remote + historical_wind")
+    print("[DEBUG] rows:", len(out))
+    print("[DEBUG] datetime range:", out["datetime"].min(), "→", out["datetime"].max())
+
+    return out
+
+
 
 def fetch_hourly_from_url(url: str, time_col: str, target_col: str) -> pd.DataFrame:
     """
@@ -88,61 +119,50 @@ def fetch_hourly_from_url(url: str, time_col: str, target_col: str) -> pd.DataFr
 
 
 def load_and_merge_history(
-    history_path: str,
     hourly_url: str | None,
     time_col: str,
     target_col: str,
     max_history_days: int | None,
+    history_path: str = "data/wind_data.csv",
+    hist_path: str = "data/historical_wind.csv",
 ) -> pd.DataFrame:
     """
-    Load Repo B history (data/wind_data.csv), optionally fetch new hourly data from Repo A,
-    append, deduplicate by timestamp, clip to max_history_days.
+    1. If hourly_url is provided, refresh data/wind_data.csv using:
+       - remote hourly file
+       - historical_wind.csv
 
-    - History in Repo B may have more columns (wind_deg, temperature, humidity, ...).
-    - Hourly CSV in Repo A may have fewer columns (datetime, wind_speed, wind_deg).
-    - We keep the union of columns; univariate LSTM only uses target_col for training.
+    2. Load data/wind_data.csv
+
+    3. Optionally trim to a rolling window of max_history_days.
     """
-    # --- load history from Repo B ---
-    if os.path.exists(history_path):
-        # auto-detect separator (comma or tab)
-        hist = pd.read_csv(history_path, sep=None, engine="python")
-        if time_col not in hist.columns or target_col not in hist.columns:
-            raise ValueError(
-                f"{history_path} must contain at least [{time_col}, {target_col}]. "
-                f"Cols found: {list(hist.columns)}"
-            )
-    else:
-        hist = pd.DataFrame(columns=[time_col, target_col])
 
-    # --- load new hourly from Repo A ---
     if hourly_url:
-        new_df = fetch_hourly_from_url(hourly_url, time_col, target_col)
-        # union of columns, missing values filled with NaN
-        all_df = pd.concat([hist, new_df], ignore_index=True, sort=False)
-    else:
-        all_df = hist.copy()
+        # ✅ This line ensures merged data is always correct (no 2024 cut-off)
+        fetch_wind_data(
+            remote_url=hourly_url,
+            local_path=history_path,
+            hist_path=hist_path,
+        )
 
-    if all_df.empty:
-        raise ValueError("No data after merging history and hourly CSV.")
+    # Now load the merged history
+    df = pd.read_csv(history_path, parse_dates=[time_col])
+    df = df.dropna(subset=[time_col, target_col])
+    df = df.sort_values(time_col).reset_index(drop=True)
 
-    all_df[time_col] = pd.to_datetime(all_df[time_col], errors="coerce")
-    all_df = all_df.dropna(subset=[time_col, target_col])
-    all_df[time_col] = all_df[time_col].dt.floor("H")
+    print("[DEBUG] After load, rows:", len(df))
+    print("[DEBUG] datetime range:", df[time_col].min(), "→", df[time_col].max())
 
-    # ensure unique hourly timestamps (keep latest row for each datetime)
-    all_df = (
-        all_df.sort_values(time_col)
-        .drop_duplicates(time_col, keep="last")
-        .reset_index(drop=True)
-    )
-
-    if max_history_days is not None and max_history_days > 0:
-        last_time = all_df[time_col].max()
+    # Apply rolling window if requested
+    if max_history_days and max_history_days > 0:
+        last_time = df[time_col].max()
         cutoff = last_time - pd.Timedelta(days=max_history_days)
-        all_df = all_df[all_df[time_col] >= cutoff].copy()
-        all_df = all_df.reset_index(drop=True)
+        df = df[df[time_col] >= cutoff].copy().reset_index(drop=True)
+        print("[DEBUG] After max_history_days trim, rows:", len(df))
+        print("[DEBUG] After max_history_days trim, datetime range:",
+              df[time_col].min(), "→", df[time_col].max())
 
-    return all_df
+    return df
+
 
 
 def make_seq_multi(series: np.ndarray, lookback: int, horizon: int):
@@ -250,104 +270,177 @@ def train_univariate_lstm(
 
 
 def main():
+    from sklearn.preprocessing import StandardScaler
     ap = argparse.ArgumentParser(
-        "Seasonal LSTM training using wind-data-pipeline repo output."
+        description="Seasonal LSTM training using wind-data-pipeline repo output."
     )
 
-    ap.add_argument(
-        "--history",
-        type=str,
-        default="data/wind_data.csv",
-        help="Historical CSV in Repo B (will be updated).",
-    )
-    ap.add_argument(
-        "--hourly_url",
-        type=str,
-        required=True,
-        help="Raw CSV URL from your wind-data-pipeline repo (Repo A).",
-    )
+    ap.add_argument("--hourly_url", type=str, required=True,
+                    help="Remote hourly CSV from Repo A (Open-Meteo pipeline).")
     ap.add_argument("--time_col", type=str, default="datetime")
     ap.add_argument("--target_col", type=str, default="wind_speed")
 
-    ap.add_argument(
-        "--max_history_days",
-        type=int,
-        default=730,
-        help="Keep at most this many days of history (e.g. 730 ~ 2 years).",
-    )
-    ap.add_argument(
-        "--train_days",
-        type=int,
-        default=180,
-        help="Train on last N days from merged history.",
-    )
-    ap.add_argument("--lookback", type=int, default=168, help="Lookback window (hours).")
-    ap.add_argument(
-        "--horizon", type=int, default=168, help="Forecast horizon (hours)."
-    )
+    ap.add_argument("--max_history_days", type=int, default=0,
+                    help="If >0, keep only this many days of history (rolling window).")
+    ap.add_argument("--train_days", type=int, default=180,
+                    help="Number of days from the end to use for training.")
+
+    ap.add_argument("--lookback", type=int, default=168,
+                    help="Number of past hours for each LSTM input window.")
+    ap.add_argument("--horizon", type=int, default=168,
+                    help="Number of future hours to predict directly.")
+
     ap.add_argument("--units", type=int, default=96)
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--dropout", type=float, default=0.2)
-    ap.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"])
-    ap.add_argument("--seed", type=int, default=202)
+    ap.add_argument("--loss", type=str, default="mse")
 
-    ap.add_argument(
-        "--output_dir",
-        type=str,
-        default="models",
-        help="Directory where lstm_model.pkl goes.",
-    )
-    ap.add_argument(
-        "--model_name",
-        type=str,
-        default="lstm_model.pkl",
-        help="Filename inside output_dir.",
-    )
+    ap.add_argument("--output_dir", type=str, default="models")
+    ap.add_argument("--model_name", type=str, default="lstm_model.pkl")
 
     args = ap.parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(args.history), exist_ok=True)
 
-    # 1) Merge existing history with new hourly data from Repo A
-    df_hist = load_and_merge_history(
-        history_path=args.history,
-        hourly_url=args.hourly_url,
-        time_col=args.time_col,
-        target_col=args.target_col,
-        max_history_days=args.max_history_days,
+    time_col = args.time_col
+    target_col = args.target_col
+
+    # ------------------------------------------------------------------
+    # 1) Build merged dataset EXACTLY like the reference fetch_wind_data
+    # ------------------------------------------------------------------
+    # This should be defined above:
+    #   def fetch_wind_data(remote_url, local_path="data/wind_data.csv",
+    #                       hist_path="data/historical_wind.csv"): ...
+    df_all = fetch_wind_data(
+        remote_url=args.hourly_url,
+        local_path="data/wind_data.csv",
+        hist_path="data/historical_wind.csv",
     )
-    df_hist.to_csv(args.history, index=False)
-    print(f"Merged history saved to {args.history} ({len(df_hist)} rows).")
-    print("History head:\n", df_hist.head())
-    print("History tail:\n", df_hist.tail())
 
-    # 2) Train LSTM on last train_days
-    model, scaler, meta = train_univariate_lstm(
-        df=df_hist,
-        time_col=args.time_col,
-        target_col=args.target_col,
-        lookback=args.lookback,
-        horizon=args.horizon,
-        train_days=args.train_days,
-        units=args.units,
+    # --------------------------------------------------
+    # 2) Basic cleaning + rolling window on full history
+    # --------------------------------------------------
+    df_all[time_col] = pd.to_datetime(df_all[time_col])
+    df_all = df_all.dropna(subset=[time_col, target_col])
+    df_all = df_all.sort_values(time_col).reset_index(drop=True)
+
+    print("[DEBUG] After fetch_wind_data merge")
+    print("[DEBUG] rows:", len(df_all))
+    print("[DEBUG] datetime range:",
+          df_all[time_col].min(), "→", df_all[time_col].max())
+
+    if args.max_history_days and args.max_history_days > 0:
+        last_time = df_all[time_col].max()
+        cutoff = last_time - pd.Timedelta(days=args.max_history_days)
+        df_all = df_all[df_all[time_col] >= cutoff].copy().reset_index(drop=True)
+        print("[DEBUG] After max_history_days trim")
+        print("[DEBUG] rows:", len(df_all))
+        print("[DEBUG] datetime range:",
+              df_all[time_col].min(), "→", df_all[time_col].max())
+
+    # ---------------------------------------------------------
+    # 3) Restrict to last train_days for actual model training
+    # ---------------------------------------------------------
+    if args.train_days and args.train_days > 0:
+        last_time = df_all[time_col].max()
+        cutoff_train = last_time - pd.Timedelta(days=args.train_days)
+        df_train = df_all[df_all[time_col] >= cutoff_train].copy().reset_index(drop=True)
+    else:
+        df_train = df_all.copy()
+
+    print("[DEBUG] Training window rows:", len(df_train))
+    print("[DEBUG] Training window datetime range:",
+          df_train[time_col].min(), "→", df_train[time_col].max())
+
+    # ------------------------------
+    # 4) Scale target & make windows
+    # ------------------------------
+    y = df_train[target_col].values.reshape(-1, 1)
+
+    scaler = StandardScaler()
+    y_scaled = scaler.fit_transform(y)
+
+    def make_windows(series: np.ndarray, lookback: int, horizon: int):
+        """
+        series: shape (N, 1) after scaling
+        returns X: (num_samples, lookback, 1), y: (num_samples, horizon)
+        """
+        X_list, y_list = [], []
+        for i in range(len(series) - lookback - horizon + 1):
+            past = series[i : i + lookback]
+            future = series[i + lookback : i + lookback + horizon]
+            X_list.append(past)
+            y_list.append(future.ravel())
+        return np.array(X_list), np.array(y_list)
+
+    X, Y = make_windows(y_scaled, args.lookback, args.horizon)
+
+    if len(X) == 0:
+        raise ValueError(
+            f"Not enough data to build windows: "
+            f"N={len(y_scaled)}, lookback={args.lookback}, horizon={args.horizon}"
+        )
+
+    print("[DEBUG] Windowed dataset shapes:", X.shape, Y.shape)
+
+    # ----------------------
+    # 5) Build & train LSTM
+    # ----------------------
+    model = tf.keras.Sequential(
+        [
+            tf.keras.layers.Input(shape=(args.lookback, 1)),
+            tf.keras.layers.LSTM(args.units, return_sequences=False),
+            tf.keras.layers.Dropout(args.dropout),
+            tf.keras.layers.Dense(args.horizon),
+        ]
+    )
+
+    model.compile(optimizer="adam", loss=args.loss)
+    model.summary()
+
+    history = model.fit(
+        X,
+        Y,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        dropout=args.dropout,
-        loss=args.loss,
-        seed=args.seed,
+        verbose=1,
     )
 
-    # 3) Export bundle as lstm_model.pkl
-    temp_model_path = os.path.join(args.output_dir, "_temp_lstm.keras")
-    model.save(temp_model_path)
+    # ------------------------------
+    # 6) Serialize model into bytes
+    # ------------------------------
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    with open(temp_model_path, "rb") as f:
+    # Save to a temporary .keras file then read bytes
+    tmp_model_path = os.path.join(args.output_dir, "_tmp_lstm.keras")
+    model.save(tmp_model_path)
+
+    with open(tmp_model_path, "rb") as f:
         model_bytes = f.read()
+
+    # Clean up temp file (optional)
     try:
-        os.remove(temp_model_path)
+        os.remove(tmp_model_path)
     except OSError:
         pass
+
+    # ------------
+    # 7) Meta info
+    # ------------
+    meta = {
+        "time_col": time_col,
+        "target_col": target_col,
+        "lookback": args.lookback,
+        "horizon": args.horizon,
+        "units": args.units,
+        "dropout": args.dropout,
+        "loss": args.loss,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "train_start": str(df_train[time_col].min()),
+        "train_end": str(df_train[time_col].max()),
+        "rows_total": int(len(df_all)),
+        "rows_train": int(len(df_train)),
+    }
 
     bundle = {
         "model_bytes": model_bytes,
@@ -361,7 +454,6 @@ def main():
 
     print(f"\nSaved pretrained LSTM bundle to {out_path}")
     print("Meta:", meta)
-
 
 if __name__ == "__main__":
     main()
