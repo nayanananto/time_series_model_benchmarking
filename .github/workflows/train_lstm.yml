@@ -38,11 +38,10 @@ jobs:
           fi
 
           python seasonal_train_lstm.py \
-            --history data/wind_data.csv \
             --hourly_url "$HOURLY_URL" \
             --time_col datetime \
             --target_col wind_speed \
-            --max_history_days 730 \
+            --max_history_days 0 \
             --train_days 180 \
             --lookback 168 \
             --horizon 168 \
